@@ -1,0 +1,1876 @@
+#!/usr/bin/env bash
+# agent-init — opinionated, idempotent project scaffolding for AI coding agents
+# v2.0.0
+#
+# Sets up a single project to work optimally with Claude Code, OpenAI Codex CLI,
+# or both — using a shared `.agents/` source of truth so the two tools stay in
+# sync automatically. Polyglot stack detection, configurable per-agent model
+# tiers, best-practice hooks, sub-agents, skills, and MCP server reference.
+#
+# Subcommands:
+#   agent-init [init] [options]     Initialize / refresh a project (default)
+#   agent-init sync [options]       Re-render .claude/ and .codex/ from .agents/
+#   agent-init doctor [options]     Detect drift, broken links, trust issues
+#   agent-init migrate [options]    Upgrade legacy claude-init projects in place
+#
+# Common options:
+#   --agent=claude|codex|both    Which tool(s) to scaffold for (default: claude)
+#   --force                      Overwrite differing files (backs them up to *.bak.<ts>)
+#   --dry-run                    Show what would happen, write nothing
+#   --quiet                      Suppress informational output
+#   --configure                  Interactive setup of global model defaults
+#   --show-config                Print resolved configuration and exit
+#   -h, --help                   This message
+#
+# Claude model tiers (high/mid/low → opus/sonnet/haiku):
+#   --planner=MODEL          Override planner specialist
+#   --reviewer=MODEL         Override code-reviewer specialist
+#   --test-runner=MODEL      Override test-runner specialist
+#   --debugger=MODEL         Override debugger specialist
+#   --preset=NAME            Apply a Claude preset (overrides individual flags)
+#
+# Codex model tiers (high/mid/low → gpt-5-pro/gpt-5.4/gpt-5.4-mini):
+#   --codex-planner=MODEL
+#   --codex-reviewer=MODEL
+#   --codex-test-runner=MODEL
+#   --codex-debugger=MODEL
+#   --codex-preset=NAME
+#
+# Claude presets:
+#   opus-heavy    — all four specialists on Opus (max quality)
+#   balanced ★    — planner/reviewer/debugger on Opus, test-runner on Sonnet (default)
+#   thrifty       — only planner on Opus, the rest on Sonnet
+#   minimal       — all four on Sonnet
+#   haiku-runner  — planner/reviewer/debugger on Opus, test-runner on Haiku
+#
+# Codex presets:
+#   pro-heavy     — all four specialists on gpt-5-pro
+#   balanced ★    — planner/reviewer/debugger on gpt-5-pro, test-runner on gpt-5.4
+#   thrifty       — planner on gpt-5-pro, the rest on gpt-5.4
+#   minimal       — all four on gpt-5.4
+#   mini-runner   — planner/reviewer/debugger on gpt-5-pro, test-runner on gpt-5.4-mini
+#
+# Configuration priority (highest wins):
+#   1. CLI flags
+#   2. Environment variables (AGENT_INIT_<TIER>_MODEL, AGENT_INIT_CODEX_<TIER>_MODEL)
+#   3. Config file (~/.config/agent-init/config — set via --configure)
+#   4. Built-in defaults (the 'balanced' preset for both tools)
+#
+# Source of truth (created in every project):
+#   AGENTS.md                          — canonical project memory (<200 lines)
+#   CLAUDE.md                          — one-liner: @AGENTS.md (+ Claude extras, if any)
+#   .agents/specialists/*.yaml         — tool-agnostic specialist IR
+#   .agents/skills/<name>/SKILL.md     — cross-tool skill definitions
+#   .agents/hooks/*.sh                 — shared shell scripts
+#   .agents/mcp.yaml                   — logical MCP server list
+#
+# Generated artifacts (per --agent flag):
+#   .claude/{settings.json,agents/,commands/,hooks/,MCP_SETUP.md}
+#   .codex/{config.toml,hooks.json,agents/,skills/,MCP_SETUP.md}
+#
+# Never hand-edit the generated dirs — edit .agents/ and run `agent-init sync`.
+
+set -euo pipefail
+
+VERSION="2.0.0"
+SUBCOMMAND="init"   # default
+FORCE=0
+DRY_RUN=0
+VERBOSE=1
+CONFIGURE=0
+SHOW_CONFIG=0
+AGENT_MODE="claude"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+
+# ============================================================================
+# Default model tiers (the 'balanced' preset for both tools)
+# ============================================================================
+
+# Claude tiers: opus / sonnet / haiku
+CLAUDE_PLANNER="opus"
+CLAUDE_REVIEWER="opus"
+CLAUDE_TESTRUNNER="sonnet"
+CLAUDE_DEBUGGER="opus"
+
+# Codex tiers: gpt-5-pro / gpt-5.4 / gpt-5.4-mini
+CODEX_PLANNER="gpt-5-pro"
+CODEX_REVIEWER="gpt-5-pro"
+CODEX_TESTRUNNER="gpt-5.4"
+CODEX_DEBUGGER="gpt-5-pro"
+
+# Codex reasoning effort per specialist (low / medium / high)
+CODEX_PLANNER_EFFORT="high"
+CODEX_REVIEWER_EFFORT="high"
+CODEX_TESTRUNNER_EFFORT="medium"
+CODEX_DEBUGGER_EFFORT="high"
+
+# ============================================================================
+# Color / logging
+# ============================================================================
+
+if [[ -t 2 ]]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  GR=$'\033[32m'; YL=$'\033[33m'; BL=$'\033[34m'; RD=$'\033[31m'; CY=$'\033[36m'
+else
+  R=""; B=""; D=""; GR=""; YL=""; BL=""; RD=""; CY=""
+fi
+log()  { [[ $VERBOSE -eq 1 ]] && printf "%s\n" "$*" >&2 || true; }
+make_() { log "${GR}+${R}  $*"; }
+keep() { log "${D}=  $*${R}"; }
+back() { log "${YL}~${R}  $*"; }
+plan_() { log "${BL}?${R}  $*"; }
+warn() { log "${YL}⚠${R}  $*"; }
+err()  { log "${RD}✗${R}  $*"; }
+note() { log "${CY}•${R}  $*"; }
+ok()   { log "${GR}✓${R}  $*"; }
+
+# ============================================================================
+# Validation helpers
+# ============================================================================
+
+CLAUDE_MODELS_RX='^(opus|sonnet|haiku)$'
+CODEX_MODELS_RX='^(gpt-5-pro|gpt-5\.4|gpt-5\.4-mini|gpt-5\.4-codex|gpt-5\.3-codex|gpt-5\.3-codex-spark)$'
+
+validate_claude_model() {
+  if ! [[ "$1" =~ $CLAUDE_MODELS_RX ]]; then
+    err "Invalid Claude model '$1' — must be opus, sonnet, or haiku."
+    exit 1
+  fi
+}
+validate_codex_model() {
+  if ! [[ "$1" =~ $CODEX_MODELS_RX ]]; then
+    err "Invalid Codex model '$1' — must be one of: gpt-5-pro, gpt-5.4, gpt-5.4-mini, gpt-5.4-codex, gpt-5.3-codex, gpt-5.3-codex-spark."
+    exit 1
+  fi
+}
+validate_agent_mode() {
+  case "$1" in
+    claude|codex|both) ;;
+    *) err "Invalid --agent value '$1' — must be claude, codex, or both."; exit 1 ;;
+  esac
+}
+
+cap_claude() {
+  case "$1" in opus) echo "Opus";; sonnet) echo "Sonnet";; haiku) echo "Haiku";; *) echo "$1";; esac
+}
+cap_codex() {
+  # Codex names are already presentation-friendly; just return them.
+  echo "$1"
+}
+
+# ============================================================================
+# Presets
+# ============================================================================
+
+apply_claude_preset() {
+  case "$1" in
+    opus-heavy|opus_heavy)
+      CLAUDE_PLANNER="opus"; CLAUDE_REVIEWER="opus"
+      CLAUDE_TESTRUNNER="opus"; CLAUDE_DEBUGGER="opus" ;;
+    balanced)
+      CLAUDE_PLANNER="opus"; CLAUDE_REVIEWER="opus"
+      CLAUDE_TESTRUNNER="sonnet"; CLAUDE_DEBUGGER="opus" ;;
+    thrifty)
+      CLAUDE_PLANNER="opus"; CLAUDE_REVIEWER="sonnet"
+      CLAUDE_TESTRUNNER="sonnet"; CLAUDE_DEBUGGER="sonnet" ;;
+    minimal)
+      CLAUDE_PLANNER="sonnet"; CLAUDE_REVIEWER="sonnet"
+      CLAUDE_TESTRUNNER="sonnet"; CLAUDE_DEBUGGER="sonnet" ;;
+    haiku-runner|haiku_runner)
+      CLAUDE_PLANNER="opus"; CLAUDE_REVIEWER="opus"
+      CLAUDE_TESTRUNNER="haiku"; CLAUDE_DEBUGGER="opus" ;;
+    *)
+      err "Unknown Claude preset '$1'. Valid: opus-heavy, balanced, thrifty, minimal, haiku-runner"
+      exit 1 ;;
+  esac
+}
+
+apply_codex_preset() {
+  case "$1" in
+    pro-heavy|pro_heavy)
+      CODEX_PLANNER="gpt-5-pro"; CODEX_REVIEWER="gpt-5-pro"
+      CODEX_TESTRUNNER="gpt-5-pro"; CODEX_DEBUGGER="gpt-5-pro"
+      CODEX_PLANNER_EFFORT="high"; CODEX_REVIEWER_EFFORT="high"
+      CODEX_TESTRUNNER_EFFORT="high"; CODEX_DEBUGGER_EFFORT="high" ;;
+    balanced)
+      CODEX_PLANNER="gpt-5-pro"; CODEX_REVIEWER="gpt-5-pro"
+      CODEX_TESTRUNNER="gpt-5.4"; CODEX_DEBUGGER="gpt-5-pro"
+      CODEX_PLANNER_EFFORT="high"; CODEX_REVIEWER_EFFORT="high"
+      CODEX_TESTRUNNER_EFFORT="medium"; CODEX_DEBUGGER_EFFORT="high" ;;
+    thrifty)
+      CODEX_PLANNER="gpt-5-pro"; CODEX_REVIEWER="gpt-5.4"
+      CODEX_TESTRUNNER="gpt-5.4"; CODEX_DEBUGGER="gpt-5.4"
+      CODEX_PLANNER_EFFORT="high"; CODEX_REVIEWER_EFFORT="medium"
+      CODEX_TESTRUNNER_EFFORT="medium"; CODEX_DEBUGGER_EFFORT="medium" ;;
+    minimal)
+      CODEX_PLANNER="gpt-5.4"; CODEX_REVIEWER="gpt-5.4"
+      CODEX_TESTRUNNER="gpt-5.4"; CODEX_DEBUGGER="gpt-5.4"
+      CODEX_PLANNER_EFFORT="medium"; CODEX_REVIEWER_EFFORT="medium"
+      CODEX_TESTRUNNER_EFFORT="medium"; CODEX_DEBUGGER_EFFORT="medium" ;;
+    mini-runner|mini_runner)
+      CODEX_PLANNER="gpt-5-pro"; CODEX_REVIEWER="gpt-5-pro"
+      CODEX_TESTRUNNER="gpt-5.4-mini"; CODEX_DEBUGGER="gpt-5-pro"
+      CODEX_PLANNER_EFFORT="high"; CODEX_REVIEWER_EFFORT="high"
+      CODEX_TESTRUNNER_EFFORT="low"; CODEX_DEBUGGER_EFFORT="high" ;;
+    *)
+      err "Unknown Codex preset '$1'. Valid: pro-heavy, balanced, thrifty, minimal, mini-runner"
+      exit 1 ;;
+  esac
+}
+
+# ============================================================================
+# Config file
+# ============================================================================
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-init"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+load_config_file() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    key="${key%%#*}"; key="${key// /}"
+    value="${value%%#*}"; value="${value// /}"
+    [[ -z "$key" || -z "$value" ]] && continue
+    case "$key" in
+      agent|default-agent|default_agent)        AGENT_MODE="$value" ;;
+      planner)                                  CLAUDE_PLANNER="$value" ;;
+      reviewer|code-reviewer)                   CLAUDE_REVIEWER="$value" ;;
+      test-runner|test_runner|tester)           CLAUDE_TESTRUNNER="$value" ;;
+      debugger)                                 CLAUDE_DEBUGGER="$value" ;;
+      codex-planner|codex_planner)              CODEX_PLANNER="$value" ;;
+      codex-reviewer|codex_reviewer)            CODEX_REVIEWER="$value" ;;
+      codex-test-runner|codex_test_runner)      CODEX_TESTRUNNER="$value" ;;
+      codex-debugger|codex_debugger)            CODEX_DEBUGGER="$value" ;;
+      codex-planner-effort|codex_planner_effort) CODEX_PLANNER_EFFORT="$value" ;;
+      codex-reviewer-effort|codex_reviewer_effort) CODEX_REVIEWER_EFFORT="$value" ;;
+      codex-test-runner-effort|codex_test_runner_effort) CODEX_TESTRUNNER_EFFORT="$value" ;;
+      codex-debugger-effort|codex_debugger_effort) CODEX_DEBUGGER_EFFORT="$value" ;;
+    esac
+  done < "$CONFIG_FILE"
+}
+load_config_file
+
+# Env vars override config file
+[[ -n "${AGENT_INIT_AGENT:-}" ]]                && AGENT_MODE="$AGENT_INIT_AGENT"
+[[ -n "${AGENT_INIT_PLANNER_MODEL:-}" ]]        && CLAUDE_PLANNER="$AGENT_INIT_PLANNER_MODEL"
+[[ -n "${AGENT_INIT_REVIEWER_MODEL:-}" ]]       && CLAUDE_REVIEWER="$AGENT_INIT_REVIEWER_MODEL"
+[[ -n "${AGENT_INIT_TESTRUNNER_MODEL:-}" ]]     && CLAUDE_TESTRUNNER="$AGENT_INIT_TESTRUNNER_MODEL"
+[[ -n "${AGENT_INIT_DEBUGGER_MODEL:-}" ]]       && CLAUDE_DEBUGGER="$AGENT_INIT_DEBUGGER_MODEL"
+[[ -n "${AGENT_INIT_CODEX_PLANNER_MODEL:-}" ]]    && CODEX_PLANNER="$AGENT_INIT_CODEX_PLANNER_MODEL"
+[[ -n "${AGENT_INIT_CODEX_REVIEWER_MODEL:-}" ]]   && CODEX_REVIEWER="$AGENT_INIT_CODEX_REVIEWER_MODEL"
+[[ -n "${AGENT_INIT_CODEX_TESTRUNNER_MODEL:-}" ]] && CODEX_TESTRUNNER="$AGENT_INIT_CODEX_TESTRUNNER_MODEL"
+[[ -n "${AGENT_INIT_CODEX_DEBUGGER_MODEL:-}" ]]   && CODEX_DEBUGGER="$AGENT_INIT_CODEX_DEBUGGER_MODEL"
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+# First positional may be a subcommand
+ARGS=()
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    init|sync|doctor|migrate) SUBCOMMAND="$1"; shift ;;
+  esac
+fi
+
+# Pre-pass: presets (so individual flags can override them)
+for a in "$@"; do
+  case "$a" in
+    --preset=*)       apply_claude_preset "${a#*=}" ;;
+    --codex-preset=*) apply_codex_preset "${a#*=}" ;;
+  esac
+done
+
+# Main pass
+for a in "$@"; do
+  case "$a" in
+    --force)        FORCE=1 ;;
+    --dry-run)      DRY_RUN=1 ;;
+    --quiet)        VERBOSE=0 ;;
+    --configure)    CONFIGURE=1 ;;
+    --show-config)  SHOW_CONFIG=1 ;;
+    --preset=*)     ;;  # handled in pre-pass
+    --codex-preset=*) ;;
+    --agent=*)      AGENT_MODE="${a#*=}" ;;
+    --planner=*)        CLAUDE_PLANNER="${a#*=}" ;;
+    --reviewer=*)       CLAUDE_REVIEWER="${a#*=}" ;;
+    --code-reviewer=*)  CLAUDE_REVIEWER="${a#*=}" ;;
+    --test-runner=*)    CLAUDE_TESTRUNNER="${a#*=}" ;;
+    --testrunner=*)     CLAUDE_TESTRUNNER="${a#*=}" ;;
+    --debugger=*)       CLAUDE_DEBUGGER="${a#*=}" ;;
+    --codex-planner=*)        CODEX_PLANNER="${a#*=}" ;;
+    --codex-reviewer=*)       CODEX_REVIEWER="${a#*=}" ;;
+    --codex-test-runner=*)    CODEX_TESTRUNNER="${a#*=}" ;;
+    --codex-testrunner=*)     CODEX_TESTRUNNER="${a#*=}" ;;
+    --codex-debugger=*)       CODEX_DEBUGGER="${a#*=}" ;;
+    -h|--help)
+      sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//' | sed '$d'
+      exit 0 ;;
+    *) echo "Unknown arg: $a (try --help)" >&2; exit 1 ;;
+  esac
+done
+
+# Validate
+validate_agent_mode "$AGENT_MODE"
+validate_claude_model "$CLAUDE_PLANNER"
+validate_claude_model "$CLAUDE_REVIEWER"
+validate_claude_model "$CLAUDE_TESTRUNNER"
+validate_claude_model "$CLAUDE_DEBUGGER"
+validate_codex_model "$CODEX_PLANNER"
+validate_codex_model "$CODEX_REVIEWER"
+validate_codex_model "$CODEX_TESTRUNNER"
+validate_codex_model "$CODEX_DEBUGGER"
+
+# Convenience: returns 1 if Claude artifacts should be generated
+needs_claude() { [[ "$AGENT_MODE" == "claude" || "$AGENT_MODE" == "both" ]]; }
+needs_codex()  { [[ "$AGENT_MODE" == "codex"  || "$AGENT_MODE" == "both" ]]; }
+
+# ============================================================================
+# --show-config
+# ============================================================================
+
+if [[ $SHOW_CONFIG -eq 1 ]]; then
+  echo "agent-init v$VERSION — resolved configuration"
+  echo
+  echo "Agent mode:    $AGENT_MODE"
+  echo
+  echo "Claude specialists (used when agent ∈ {claude, both}):"
+  echo "  planner       $CLAUDE_PLANNER"
+  echo "  code-reviewer $CLAUDE_REVIEWER"
+  echo "  test-runner   $CLAUDE_TESTRUNNER"
+  echo "  debugger      $CLAUDE_DEBUGGER"
+  echo
+  echo "Codex specialists (used when agent ∈ {codex, both}):"
+  echo "  planner       $CODEX_PLANNER   (effort: $CODEX_PLANNER_EFFORT)"
+  echo "  code-reviewer $CODEX_REVIEWER   (effort: $CODEX_REVIEWER_EFFORT)"
+  echo "  test-runner   $CODEX_TESTRUNNER   (effort: $CODEX_TESTRUNNER_EFFORT)"
+  echo "  debugger      $CODEX_DEBUGGER   (effort: $CODEX_DEBUGGER_EFFORT)"
+  echo
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo "Config file:   $CONFIG_FILE (loaded)"
+  else
+    echo "Config file:   $CONFIG_FILE (not present — using defaults)"
+  fi
+  exit 0
+fi
+
+# ============================================================================
+# --configure
+# ============================================================================
+
+if [[ $CONFIGURE -eq 1 ]]; then
+  if [[ ! -t 0 ]]; then
+    err "--configure needs an interactive terminal (stdin is not a TTY)."
+    exit 1
+  fi
+  log ""
+  log "${B}agent-init configuration${R}"
+  log ""
+  log "Sets global defaults written to $CONFIG_FILE."
+  log "Per-project, override with flags or per-shell env vars."
+  log ""
+
+  prompt_value() {
+    local label="$1" varname="$2" current="$3" valid_rx="$4" choices="$5" choice
+    while true; do
+      printf "%-32s [current: %s] : " "$label" "$current" >&2
+      read -r choice
+      [[ -z "$choice" ]] && choice="$current"
+      if [[ "$choice" =~ $valid_rx ]]; then
+        eval "$varname=\"$choice\""; break
+      else
+        printf "  ↳ '%s' is not valid. Choices: %s\n" "$choice" "$choices" >&2
+      fi
+    done
+  }
+
+  prompt_value "Default agent (claude|codex|both)" AGENT_MODE "$AGENT_MODE" '^(claude|codex|both)$' "claude, codex, both"
+  log ""
+  log "${B}Claude specialist models${R} (opus, sonnet, haiku)"
+  prompt_value "  planner"        CLAUDE_PLANNER    "$CLAUDE_PLANNER"    "$CLAUDE_MODELS_RX" "opus, sonnet, haiku"
+  prompt_value "  code-reviewer"  CLAUDE_REVIEWER   "$CLAUDE_REVIEWER"   "$CLAUDE_MODELS_RX" "opus, sonnet, haiku"
+  prompt_value "  test-runner"    CLAUDE_TESTRUNNER "$CLAUDE_TESTRUNNER" "$CLAUDE_MODELS_RX" "opus, sonnet, haiku"
+  prompt_value "  debugger"       CLAUDE_DEBUGGER   "$CLAUDE_DEBUGGER"   "$CLAUDE_MODELS_RX" "opus, sonnet, haiku"
+  log ""
+  log "${B}Codex specialist models${R} (gpt-5-pro, gpt-5.4, gpt-5.4-mini, ...)"
+  prompt_value "  planner"        CODEX_PLANNER    "$CODEX_PLANNER"    "$CODEX_MODELS_RX" "gpt-5-pro, gpt-5.4, gpt-5.4-mini"
+  prompt_value "  code-reviewer"  CODEX_REVIEWER   "$CODEX_REVIEWER"   "$CODEX_MODELS_RX" "gpt-5-pro, gpt-5.4, gpt-5.4-mini"
+  prompt_value "  test-runner"    CODEX_TESTRUNNER "$CODEX_TESTRUNNER" "$CODEX_MODELS_RX" "gpt-5-pro, gpt-5.4, gpt-5.4-mini"
+  prompt_value "  debugger"       CODEX_DEBUGGER   "$CODEX_DEBUGGER"   "$CODEX_MODELS_RX" "gpt-5-pro, gpt-5.4, gpt-5.4-mini"
+
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<EOF
+# agent-init global config
+# Per-project overrides: --agent=both, --planner=opus, --codex-preset=balanced, etc.
+
+agent=$AGENT_MODE
+
+# Claude specialist models (opus, sonnet, haiku)
+planner=$CLAUDE_PLANNER
+reviewer=$CLAUDE_REVIEWER
+test-runner=$CLAUDE_TESTRUNNER
+debugger=$CLAUDE_DEBUGGER
+
+# Codex specialist models (gpt-5-pro, gpt-5.4, gpt-5.4-mini, ...)
+codex-planner=$CODEX_PLANNER
+codex-reviewer=$CODEX_REVIEWER
+codex-test-runner=$CODEX_TESTRUNNER
+codex-debugger=$CODEX_DEBUGGER
+
+# Codex reasoning effort per specialist (low, medium, high)
+codex-planner-effort=$CODEX_PLANNER_EFFORT
+codex-reviewer-effort=$CODEX_REVIEWER_EFFORT
+codex-test-runner-effort=$CODEX_TESTRUNNER_EFFORT
+codex-debugger-effort=$CODEX_DEBUGGER_EFFORT
+EOF
+  log ""
+  ok "Saved to $CONFIG_FILE"
+  exit 0
+fi
+
+# ============================================================================
+# Preflight
+# ============================================================================
+
+if ! command -v jq >/dev/null 2>&1; then
+  err "jq not found. Install: brew install jq (macOS) or apt install jq (Linux)"
+  exit 1
+fi
+
+# Tool checks are advisory, not blocking — you may scaffold for an agent you
+# haven't installed yet.
+if needs_claude && ! command -v claude >/dev/null 2>&1; then
+  warn "claude CLI not found (scaffolding for Claude anyway). Install when ready: npm i -g @anthropic-ai/claude-code"
+fi
+if needs_codex && ! command -v codex >/dev/null 2>&1; then
+  warn "codex CLI not found (scaffolding for Codex anyway). Install when ready: npm i -g @openai/codex"
+fi
+
+# Git check (advisory)
+if [[ ! -d .git ]] && [[ "$SUBCOMMAND" != "doctor" ]]; then
+  warn "Not a git repo. Hooks and conventions assume git. Consider 'git init' first."
+fi
+
+PROJECT_NAME="$(basename "$PWD")"
+SOT_DIR=".agents"   # source-of-truth directory
+
+# ============================================================================
+# Stack detection (polyglot)
+# ============================================================================
+
+STACKS=()
+[[ -f package.json ]] && STACKS+=("Node/TypeScript")
+[[ -f pyproject.toml || -f requirements.txt || -f setup.py || -f Pipfile ]] && STACKS+=("Python")
+[[ -f Cargo.toml ]] && STACKS+=("Rust")
+[[ -f go.mod ]] && STACKS+=("Go")
+[[ -f Gemfile ]] && STACKS+=("Ruby")
+[[ -f composer.json ]] && STACKS+=("PHP")
+[[ -f pom.xml || -f build.gradle || -f build.gradle.kts ]] && STACKS+=("JVM")
+shopt -s nullglob
+TF_FILES=(*.tf)
+[[ ${#TF_FILES[@]} -gt 0 ]] && STACKS+=("Terraform")
+shopt -u nullglob
+[[ -f serverless.yml || -f serverless.yaml ]] && STACKS+=("Serverless Framework")
+[[ -f Dockerfile || -f docker-compose.yml || -f compose.yml ]] && STACKS+=("Docker")
+[[ ${#STACKS[@]} -eq 0 ]] && STACKS=("(no stack detected — fill in AGENTS.md manually)")
+
+# Detect commands
+BUILD_CMD=""; TEST_CMD=""; LINT_CMD=""; DEV_CMD=""
+if [[ -f package.json ]]; then
+  jq -e '.scripts.test'  package.json >/dev/null 2>&1 && TEST_CMD="npm test"
+  jq -e '.scripts.build' package.json >/dev/null 2>&1 && BUILD_CMD="npm run build"
+  jq -e '.scripts.lint'  package.json >/dev/null 2>&1 && LINT_CMD="npm run lint"
+  jq -e '.scripts.dev'   package.json >/dev/null 2>&1 && DEV_CMD="npm run dev"
+fi
+if [[ -z "$TEST_CMD" ]]; then
+  if [[ -f pyproject.toml || -f requirements.txt || -f setup.py ]]; then
+    TEST_CMD="pytest -q"
+  elif [[ -f Cargo.toml ]]; then TEST_CMD="cargo test"
+  elif [[ -f go.mod ]]; then TEST_CMD="go test ./..."
+  fi
+fi
+
+# ============================================================================
+# Write helpers (idempotent)
+# ============================================================================
+
+write_text() {
+  local path="$1"; local body="$2"
+  # Normalize: strip trailing newlines/whitespace so equality comparison is robust
+  # against accumulated heredoc trailing newlines.
+  while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done
+  if [[ -e "$path" ]]; then
+    local on_disk
+    on_disk="$(cat "$path" 2>/dev/null || true)"
+    while [[ "$on_disk" == *$'\n' ]]; do on_disk="${on_disk%$'\n'}"; done
+    if [[ "$on_disk" == "$body" ]]; then
+      if [[ $FORCE -eq 1 ]]; then
+        keep "$path (already current — no rewrite needed)"
+      else
+        keep "$path (unchanged)"
+      fi
+      return 0
+    fi
+    if [[ $FORCE -eq 1 ]]; then
+      if [[ $DRY_RUN -eq 1 ]]; then plan_ "would back up + overwrite $path"; return 0; fi
+      cp "$path" "${path}.bak.${TIMESTAMP}"; back "${path}.bak.${TIMESTAMP}"
+    else
+      keep "$path (exists, differs; --force to overwrite)"; return 0
+    fi
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then plan_ "would create $path"; return 0; fi
+  mkdir -p "$(dirname "$path")"
+  printf "%s\n" "$body" > "$path"
+  make_ "$path"
+}
+
+write_exec() {
+  write_text "$1" "$2"
+  if [[ $DRY_RUN -eq 0 && -e "$1" ]]; then
+    chmod +x "$1"
+  fi
+  return 0
+}
+
+ensure_symlink() {
+  local link="$1" target="$2"
+  if [[ -L "$link" ]]; then
+    local current
+    current="$(readlink "$link")"
+    if [[ "$current" == "$target" ]]; then
+      keep "$link → $target (unchanged)"
+      return 0
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then plan_ "would update symlink $link → $target"; return 0; fi
+    rm "$link"
+  elif [[ -e "$link" ]]; then
+    if [[ $FORCE -eq 1 ]]; then
+      if [[ $DRY_RUN -eq 1 ]]; then plan_ "would back up + replace $link with symlink → $target"; return 0; fi
+      mv "$link" "${link}.bak.${TIMESTAMP}"; back "${link}.bak.${TIMESTAMP}"
+    else
+      keep "$link (exists as file, not symlink; --force to replace)"; return 0
+    fi
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then plan_ "would create symlink $link → $target"; return 0; fi
+  mkdir -p "$(dirname "$link")"
+  ln -s "$target" "$link"
+  make_ "$link → $target"
+}
+
+# ============================================================================
+# Gitignore
+# ============================================================================
+
+add_gitignore() {
+  local entries=(
+    ".agents/local/"
+    ".agents/SKIP_TESTS"
+    ".claude/settings.local.json"
+    ".codex/auth.json"
+    "*.bak.[0-9]*"
+  )
+  if [[ ! -f .gitignore ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then plan_ "would create .gitignore"; return; fi
+    printf "# Agent tooling\n" > .gitignore
+    make_ ".gitignore"
+  fi
+  for e in "${entries[@]}"; do
+    if ! grep -qxF "$e" .gitignore 2>/dev/null; then
+      if [[ $DRY_RUN -eq 1 ]]; then plan_ "would add '$e' to .gitignore"; continue; fi
+      printf "%s\n" "$e" >> .gitignore
+      make_ ".gitignore += $e"
+    fi
+  done
+}
+
+# ============================================================================
+# Subcommand dispatch (rest of script wired up below)
+# ============================================================================
+
+case "$SUBCOMMAND" in
+  init|sync|doctor|migrate) ;;
+  *) err "Unknown subcommand '$SUBCOMMAND'"; exit 1 ;;
+esac
+
+# ============================================================================
+# Content templates — Source of Truth (.agents/)
+# ============================================================================
+
+# ---------- AGENTS.md ----------
+build_agents_md() {
+  local stack_line cmd_block
+  stack_line="$(IFS=, ; echo "${STACKS[*]}")"
+  cmd_block=""
+  [[ -n "$BUILD_CMD" ]] && cmd_block+="- Build: \`${BUILD_CMD}\`"$'\n'
+  [[ -n "$TEST_CMD"  ]] && cmd_block+="- Test:  \`${TEST_CMD}\`"$'\n'
+  [[ -n "$LINT_CMD"  ]] && cmd_block+="- Lint:  \`${LINT_CMD}\`"$'\n'
+  [[ -n "$DEV_CMD"   ]] && cmd_block+="- Dev:   \`${DEV_CMD}\`"$'\n'
+  [[ -z "$cmd_block" ]] && cmd_block="- TODO: document build/test/lint/dev commands here."$'\n'
+
+  cat <<EOF
+# ${PROJECT_NAME}
+
+<!-- Initialized by agent-init v${VERSION} on $(date +%Y-%m-%d) -->
+<!-- Canonical project memory. Read by Codex natively; by Claude via CLAUDE.md's @AGENTS.md import. -->
+<!-- Keep under ~200 lines. Both agents read this every turn. -->
+
+## What this is
+
+TODO: 2–3 sentences. What does it do, who uses it, what's the deploy surface?
+
+## Stack
+
+${stack_line}
+
+## Build & test
+
+${cmd_block}
+## Topology
+
+- \`src/\` — application code
+- \`tests/\` — test suite
+- \`.agents/\` — canonical agent config (specialists, skills, hooks, MCP)
+- \`.claude/\` — generated Claude Code config (do not hand-edit)
+- \`.codex/\` — generated Codex CLI config (do not hand-edit)
+- TODO: document the rest
+
+## Conventions
+
+- Match existing patterns. Search before inventing — grep/glob first.
+- New files mirror nearest-neighbor structure.
+- No new dependencies without justification.
+- Tests are required for new code paths.
+- Edit \`.agents/\` (the source of truth), then run \`agent-init sync\` to refresh \`.claude/\` and \`.codex/\`.
+
+## Guardrails (never do these)
+
+- Never commit secrets, .env files, or credentials.
+- Never push directly to \`main\` / \`master\`. Branch + PR.
+- Never modify generated artifacts (\`dist/\`, \`build/\`, \`.next/\`, \`__pycache__/\`, \`target/\`).
+- Never disable a test to get green. Fix the cause or ask.
+- Never rewrite migrations that have run anywhere.
+
+## Specialists (use them)
+
+Defined in \`.agents/specialists/\` and rendered for both tools:
+
+- \`planner\` — call BEFORE coding any feature touching >2 files
+- \`code-reviewer\` — call AFTER a feature, before commit; catches subtle correctness/security issues
+- \`test-runner\` — call instead of running tests inline; saves context
+- \`debugger\` — call when a test fails or behavior is unexpected; root-cause analysis
+
+## Skills
+
+Cross-tool skill definitions in \`.agents/skills/\`. Both Claude and Codex read them:
+
+- \`plan\` — decompose a request into ordered, verifiable steps
+- \`review\` — review uncommitted changes for correctness/security
+- \`ship\` — run tests, then commit if green (no push)
+
+## MCP
+
+See \`.claude/MCP_SETUP.md\` (Claude) and/or \`.codex/MCP_SETUP.md\` (Codex) for installable
+servers. Logical server list lives in \`.agents/mcp.yaml\`.
+
+## Failure modes (lessons learned)
+
+<!-- Add as you discover them. This is the most valuable section over time. Examples: -->
+<!-- - The \`users\` table has soft deletes (deleted_at); always filter unless told otherwise. -->
+<!-- - Integration tests need Postgres on port 5433 (\`docker-compose up -d db\`). -->
+
+TODO: Start populating after the first session. When an agent gets something wrong, document it here.
+EOF
+}
+
+# ---------- CLAUDE.md bridge ----------
+build_claude_md_bridge() {
+  cat <<'EOF'
+@AGENTS.md
+
+<!-- This file is a Claude Code bridge to AGENTS.md (the canonical project memory). -->
+<!-- Claude Code does not natively read AGENTS.md as of May 2026, so we import it via @-syntax. -->
+<!-- Put Claude-specific extras (model-specific notes, plan-mode tips) below this line if needed. -->
+EOF
+}
+
+# ---------- Specialist YAML IR ----------
+build_specialist_planner() {
+  cat <<'EOF'
+name: planner
+description: Use BEFORE coding any feature that touches more than 2 files, or any change with non-obvious architectural implications. Produces a written plan; never writes code.
+model_tier: high
+tools_claude: [Read, Grep, Glob, WebSearch, WebFetch]
+sandbox_codex: read-only
+system_prompt: |
+  You are a senior architect. Given a feature request:
+
+  1. Read the relevant existing code. Use grep/glob aggressively to find prior art before assuming greenfield.
+  2. Identify the minimum set of files to change. Smaller diffs > larger diffs.
+  3. Write a numbered plan. Each step:
+     - One file (or one focused area)
+     - One change
+     - One testable outcome
+  4. Call out RISKS explicitly:
+     - Data migrations or schema changes
+     - Breaking API or contract changes
+     - Test coverage gaps
+     - Security implications (auth, input validation, secrets)
+     - Performance implications (N+1, large allocations)
+  5. List OPEN QUESTIONS the human should answer before execution.
+  6. STOP. Do not write code. Do not edit files. The main agent executes the plan.
+
+  Plans should fit on one screen (≤ 15 numbered steps). Larger features → break into phases.
+  Output format: a markdown doc with sections "Plan", "Risks", "Open Questions".
+EOF
+}
+
+build_specialist_reviewer() {
+  cat <<'EOF'
+name: code-reviewer
+description: Use AFTER a feature is implemented and BEFORE commit, or to review a specific commit/branch/file. Read-only — reports issues, never edits.
+model_tier: high
+tools_claude: [Read, Grep, Glob, Bash]
+sandbox_codex: read-only
+system_prompt: |
+  You are a senior code reviewer. Determine scope from the request (default: uncommitted changes via `git diff` and `git status`). Review for:
+
+  1. **Correctness** — logic errors, off-by-one, null handling, race conditions, error paths.
+  2. **Security** — injection, secrets in code, unsafe deserialization, missing authn/authz, SSRF, path traversal.
+  3. **Conventions** — does it match existing patterns? Use grep to verify before flagging deviations.
+  4. **Tests** — are new code paths covered? Are existing tests still meaningful?
+  5. **Performance** — obvious O(n²), N+1 queries, unbounded allocations, blocking I/O on hot paths.
+  6. **API/contract stability** — breaking changes flagged loudly.
+
+  Output format:
+  - **BLOCKING** (must fix before merge): bullets, each with `path:line` and a one-line rationale.
+  - **SUGGESTIONS** (nice to have): bullets, same format.
+  - **LGTM** if nothing material.
+
+  Read-only. Do not propose code edits inline; describe the issue. The main agent decides what to do.
+EOF
+}
+
+build_specialist_testrunner() {
+  cat <<'EOF'
+name: test-runner
+description: Use to run tests without bloating the main context. Returns failure summaries only — fast, focused, reliable parsing of real test output.
+model_tier: mid
+tools_claude: [Bash, Read, Grep]
+sandbox_codex: workspace-write
+system_prompt: |
+  You are a focused test runner. Your job:
+
+  1. Detect the test framework (package.json scripts, pytest, cargo test, go test, etc.).
+  2. Run the full suite OR a scoped subset if requested ("just the auth tests", "only TestFoo").
+  3. Return a tight summary:
+     - PASS count / FAIL count / SKIP count
+     - For each failure: `path:line — test name — one-line assertion error`
+     - First-suspect file/function based on stack trace
+
+  If everything passes: return one line — `✓ N passed.`
+
+  DO NOT:
+  - Propose fixes
+  - Modify any files
+  - Explain what tests are or how they work
+  - Re-run flaky tests more than once
+
+  You exist to keep the main agent's context clean. Return less, not more.
+EOF
+}
+
+build_specialist_debugger() {
+  cat <<'EOF'
+name: debugger
+description: Use when a test is failing, an error is occurring, or behavior is unexpected. Reproduces, isolates, applies a minimal fix, verifies.
+model_tier: high
+tools_claude: [Read, Grep, Glob, Bash, Edit]
+sandbox_codex: workspace-write
+system_prompt: |
+  You are a debugging specialist. Given a bug report or failing test:
+
+  1. **Reproduce.** Run the failing case yourself. Capture exact error + stack.
+  2. **Isolate.** Bisect by reading the trace, hypothesizing the bug location, and verifying with prints/logs/Read. Do not fix until you have a confirmed hypothesis.
+  3. **Diagnose.** State root cause in one sentence: "X happens because Y."
+  4. **Fix.** Smallest possible change that resolves the bug. No incidental refactors.
+  5. **Test.** Add a regression test if one doesn't already exist. Then rerun the failing case + adjacent tests.
+  6. **Report.** Brief writeup: what was broken, why, what changed, what's now covered by tests.
+
+  Rules:
+  - One bug, one fix. If you find a second bug while debugging, note it; don't fix it in this session.
+  - If reproduction fails (intermittent / environmental), say so and stop. Don't speculate-fix.
+  - If the fix would touch >3 files, escalate back to the main agent — that's planner territory.
+EOF
+}
+
+# ---------- Cross-tool skills ----------
+build_skill_plan() {
+  cat <<'EOF'
+---
+name: plan
+description: Decompose a feature or bug-fix request into ordered verifiable steps. Triggers when the user asks to "plan", "design", "decompose", "break down", or describes a multi-step task before writing code.
+---
+
+## Steps
+
+1. Restate the goal in one sentence.
+2. List the files most likely to need changes (read-only exploration only).
+3. Produce a numbered plan; each step has:
+   - a one-sentence description
+   - a concrete verification command (test, lint, manual check)
+4. Hand off to `code-reviewer` for risk callouts before any implementation.
+5. Wait for user confirmation before invoking `test-runner` or implementation.
+
+## Constraints
+
+- Do not edit any files in this turn.
+- If repo conventions in AGENTS.md conflict with the user's request, surface the conflict explicitly.
+EOF
+}
+
+build_skill_review() {
+  cat <<'EOF'
+---
+name: review
+description: Review uncommitted changes (or a specified target) for correctness, security, conventions, and missing tests. Triggers when the user asks to "review", "audit", "check my code", or before committing.
+---
+
+## Steps
+
+1. Default target: uncommitted changes from `git diff` and `git status`.
+2. If the user specifies a branch, file, or commit, use that instead.
+3. Invoke the `code-reviewer` specialist with the chosen target.
+4. Return the verbatim review: BLOCKING / SUGGESTIONS / LGTM.
+
+## Constraints
+
+- Read-only. Never edit files during review.
+- Report `path:line` for every finding.
+EOF
+}
+
+build_skill_ship() {
+  cat <<'EOF'
+---
+name: ship
+description: Run tests via the test-runner specialist, then commit (no push) if green. Triggers when the user asks to "ship", "commit", or "finalize this work".
+---
+
+## Steps
+
+1. Invoke the `test-runner` specialist. If it returns any failures, STOP and report — do not commit.
+2. Run any project linters (npm run lint, ruff check, cargo clippy, etc.) if present. Surface errors.
+3. If everything is green:
+   - `git status` to confirm scope
+   - `git add -A`
+   - `git commit -m "<message>"` — message from $ARGUMENTS, or generate a Conventional Commits message summarizing the diff
+4. Do NOT push. Show the commit hash and summary; let the human push.
+EOF
+}
+
+# ---------- Shared hooks ----------
+build_hook_format() {
+  cat <<'BASH'
+#!/usr/bin/env bash
+# Polyglot post-edit formatter. Reads agent hook JSON from stdin.
+# Failures never block — formatting is best-effort.
+# Used by both Claude Code (PostToolUse) and Codex CLI (PostToolUse).
+set -uo pipefail
+
+INPUT="$(cat)"
+
+# Claude Code provides .tool_input.file_path; Codex provides .tool_input.path or .files[]
+FILE="$(printf "%s" "$INPUT" | jq -r '
+  .tool_input.file_path
+  // .tool_input.path
+  // (.tool_input.files // [])[0]
+  // empty' 2>/dev/null || true)"
+
+[[ -z "$FILE" || ! -f "$FILE" ]] && exit 0
+
+case "$FILE" in
+  *.js|*.jsx|*.ts|*.tsx|*.mjs|*.cjs|*.json|*.jsonc|*.md|*.mdx|*.yml|*.yaml|*.css|*.scss|*.html)
+    if command -v biome >/dev/null 2>&1 && [[ -f biome.json || -f biome.jsonc ]]; then
+      biome format --write "$FILE" >/dev/null 2>&1 || true
+    elif [[ -x node_modules/.bin/prettier ]]; then
+      node_modules/.bin/prettier --write --log-level silent "$FILE" >/dev/null 2>&1 || true
+    elif command -v prettier >/dev/null 2>&1; then
+      prettier --write --log-level silent "$FILE" >/dev/null 2>&1 || true
+    fi
+    ;;
+  *.py)
+    if command -v ruff >/dev/null 2>&1; then
+      ruff format "$FILE" >/dev/null 2>&1 || true
+      ruff check --fix --quiet "$FILE" >/dev/null 2>&1 || true
+    elif command -v black >/dev/null 2>&1; then
+      black --quiet "$FILE" 2>/dev/null || true
+    fi
+    ;;
+  *.go)
+    command -v gofmt >/dev/null 2>&1 && gofmt -w "$FILE" 2>/dev/null || true
+    command -v goimports >/dev/null 2>&1 && goimports -w "$FILE" 2>/dev/null || true
+    ;;
+  *.rs)
+    command -v rustfmt >/dev/null 2>&1 && rustfmt --quiet "$FILE" 2>/dev/null || true
+    ;;
+  *.tf|*.tfvars)
+    command -v terraform >/dev/null 2>&1 && terraform fmt "$FILE" >/dev/null 2>&1 || true
+    ;;
+  *.sh|*.bash)
+    command -v shfmt >/dev/null 2>&1 && shfmt -w -i 2 "$FILE" 2>/dev/null || true
+    ;;
+  *.rb)
+    command -v rubocop >/dev/null 2>&1 && rubocop -A --force-exclusion "$FILE" >/dev/null 2>&1 || true
+    ;;
+esac
+
+exit 0
+BASH
+}
+
+build_hook_danger() {
+  cat <<'BASH'
+#!/usr/bin/env bash
+# Pre-Bash safety net. Returns exit 2 to BLOCK execution of dangerous commands.
+# Used by both Claude Code (PreToolUse) and Codex CLI (PreToolUse).
+#
+# NOTE: Codex CLI's PreToolUse hook reliably fires for Bash but has incomplete
+# coverage for apply_patch and MCP tool calls (as of May 2026, openai/codex#16732).
+# Treat this as defense-in-depth, not a hard boundary.
+set -uo pipefail
+
+INPUT="$(cat)"
+
+# Claude Code: .tool_input.command. Codex: .tool_input.command or .tool_input.cmd.
+CMD="$(printf "%s" "$INPUT" | jq -r '
+  .tool_input.command
+  // .tool_input.cmd
+  // (.tool_input.argv // [] | join(" "))
+  // empty' 2>/dev/null || true)"
+
+[[ -z "$CMD" ]] && exit 0
+
+DANGER_PATTERNS=(
+  'rm[[:space:]]+-rf?[[:space:]]+/'
+  'rm[[:space:]]+-rf?[[:space:]]+~'
+  'rm[[:space:]]+-rf?[[:space:]]+\$HOME'
+  'rm[[:space:]]+-rf?[[:space:]]+\.\.?(/|$| )'
+  'mkfs\.'
+  'dd[[:space:]]+if=.*[[:space:]]+of=/dev/'
+  ':\(\)\{ :\|:& \};:'
+  'chmod[[:space:]]+-R[[:space:]]+777[[:space:]]+/'
+  'chown[[:space:]]+-R[[:space:]]+.*[[:space:]]+/'
+  '>[[:space:]]*/dev/sd[a-z]'
+  'aws[[:space:]]+s3[[:space:]]+rb[[:space:]]+.*--force'
+  'aws[[:space:]]+s3[[:space:]]+rm[[:space:]]+s3://.*--recursive'
+  'aws[[:space:]]+iam[[:space:]]+(delete-user|delete-role|delete-policy)'
+  'aws[[:space:]]+lambda[[:space:]]+delete-function'
+  'aws[[:space:]]+rds[[:space:]]+delete-db-(instance|cluster)'
+  'DROP[[:space:]]+(DATABASE|SCHEMA)'
+  'TRUNCATE[[:space:]]+TABLE'
+  'git[[:space:]]+push[[:space:]]+(-f|--force)([[:space:]]+\S+)?[[:space:]]+(main|master|production|prod)'
+  'git[[:space:]]+push[[:space:]]+\S+[[:space:]]+(main|master|production|prod)[[:space:]]+(-f|--force)'
+  'git[[:space:]]+reset[[:space:]]+--hard[[:space:]]+(origin/)?(main|master|production)'
+  'curl.+\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh|zsh)'
+  'wget.+\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh|zsh)'
+)
+
+for pat in "${DANGER_PATTERNS[@]}"; do
+  if printf "%s" "$CMD" | grep -qiE "$pat"; then
+    cat <<MSG >&2
+🛑 BLOCKED by .agents/hooks/danger-guard.sh
+Command: $CMD
+Pattern: $pat
+
+If you genuinely need this, run it manually outside the agent,
+or edit .agents/hooks/danger-guard.sh to remove the pattern.
+MSG
+    exit 2
+  fi
+done
+
+exit 0
+BASH
+}
+
+build_hook_stop() {
+  cat <<'BASH'
+#!/usr/bin/env bash
+# On Stop, run the project test suite. Exit 2 to keep the agent going if tests fail.
+# Used by both Claude Code (Stop) and Codex CLI (Stop).
+# Bypass: touch .agents/SKIP_TESTS  (e.g. when explicitly debugging tests themselves).
+set -uo pipefail
+
+INPUT="$(cat)"
+ACTIVE="$(printf "%s" "$INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null || echo false)"
+
+# Avoid infinite loop: if we already triggered the stop hook, let the agent finish.
+[[ "$ACTIVE" == "true" ]] && exit 0
+[[ -f .agents/SKIP_TESTS ]] && exit 0
+
+# Skip tests if no source files changed in the last turn (saves quota / time).
+if command -v git >/dev/null 2>&1 && [[ -d .git ]]; then
+  if [[ -z "$(git status --porcelain)" ]]; then
+    exit 0
+  fi
+fi
+
+run() {
+  local label="$1"; shift
+  local out
+  if out="$("$@" 2>&1)"; then
+    return 0
+  else
+    cat <<MSG >&2
+✗ $label failed. Tests must pass before stopping.
+$out
+MSG
+    return 1
+  fi
+}
+
+if [[ -f package.json ]] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+  run "npm test" npm test --silent || exit 2
+elif [[ -f pyproject.toml || -f pytest.ini || -f setup.cfg ]] && command -v pytest >/dev/null 2>&1; then
+  run "pytest" pytest -q || exit 2
+elif [[ -f Cargo.toml ]]; then
+  run "cargo test" cargo test --quiet || exit 2
+elif [[ -f go.mod ]]; then
+  run "go test" go test ./... || exit 2
+fi
+
+exit 0
+BASH
+}
+
+# ---------- MCP logical list (YAML) ----------
+build_mcp_yaml() {
+  cat <<'EOF'
+# .agents/mcp.yaml — logical MCP server list, rendered into both
+# .claude/MCP_SETUP.md (JSON examples) and .codex/MCP_SETUP.md (TOML examples).
+#
+# Uncomment / add servers as needed. The renderer generates copy-paste install
+# commands for whichever agent(s) this project supports.
+
+servers:
+  - name: github
+    description: Official GitHub MCP — PRs, issues, branch ops.
+    transport: http
+    url: https://api.githubcopilot.com/mcp/
+    auth: bearer
+    auth_env: GITHUB_PAT
+    category: core
+
+  - name: context7
+    description: Live, version-pinned library docs — kills hallucinated APIs.
+    transport: stdio
+    command: npx
+    args: [-y, '@upstash/context7-mcp']
+    category: core
+
+  - name: postgres
+    description: Postgres / Redshift (Postgres wire protocol).
+    transport: stdio
+    command: npx
+    args: [-y, '@modelcontextprotocol/server-postgres']
+    env:
+      POSTGRES_CONNECTION_STRING: 'postgres://USER:PASS@HOST:5432/DB'
+    category: data
+    notes: Use read-only role in prod.
+
+  - name: playwright
+    description: Browser automation, UI verification.
+    transport: stdio
+    command: npx
+    args: ['@playwright/mcp@latest']
+    category: browser
+
+  - name: sentry
+    description: Sentry alerts → fix loops.
+    transport: http
+    url: https://mcp.sentry.dev/mcp
+    auth: oauth
+    category: observability
+EOF
+}
+
+# ============================================================================
+# Renderers — produce .claude/ and .codex/ from .agents/
+# ============================================================================
+
+render_claude_settings() {
+  cat <<'JSON'
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.agents/hooks/danger-guard.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.agents/hooks/format.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.agents/hooks/test-on-stop.sh" }
+        ]
+      }
+    ]
+  }
+}
+JSON
+}
+
+# Render a Claude specialist (.md with YAML frontmatter) from a .agents/specialists/*.yaml IR.
+# Args: $1=ir_yaml_file, $2=claude_model
+render_claude_specialist() {
+  local ir="$1" model="$2"
+  # Extract fields from YAML (simple parser — assumes our own format)
+  local name desc tools sys_prompt
+  name="$(awk '/^name:/{print $2; exit}' "$ir")"
+  desc="$(awk '/^description:/{sub(/^description:[[:space:]]*/,""); print; exit}' "$ir")"
+  tools="$(awk '/^tools_claude:/{sub(/^tools_claude:[[:space:]]*/,""); print; exit}' "$ir")"
+  # Extract multi-line system_prompt: everything after the "system_prompt: |" line
+  sys_prompt="$(awk '/^system_prompt:[[:space:]]*\|/{flag=1; next} flag{sub(/^  /,""); print}' "$ir")"
+
+  cat <<EOF
+---
+name: $name
+description: $desc
+tools: $tools
+model: $model
+---
+
+$sys_prompt
+EOF
+}
+
+# Render a Codex specialist (.toml) from the IR.
+# Args: $1=ir_yaml_file, $2=codex_model, $3=codex_effort
+render_codex_specialist() {
+  local ir="$1" model="$2" effort="$3"
+  local name desc sandbox sys_prompt
+  name="$(awk '/^name:/{print $2; exit}' "$ir")"
+  desc="$(awk '/^description:/{sub(/^description:[[:space:]]*/,""); print; exit}' "$ir")"
+  sandbox="$(awk '/^sandbox_codex:/{print $2; exit}' "$ir")"
+  [[ -z "$sandbox" ]] && sandbox="workspace-write"
+  sys_prompt="$(awk '/^system_prompt:[[:space:]]*\|/{flag=1; next} flag{sub(/^  /,""); print}' "$ir")"
+
+  cat <<EOF
+name = "$name"
+description = "$desc"
+model = "$model"
+model_reasoning_effort = "$effort"
+sandbox_mode = "$sandbox"
+developer_instructions = """
+$sys_prompt
+"""
+EOF
+}
+
+# Render the Codex config.toml header (top-level settings + [agents] registry).
+render_codex_config() {
+  cat <<EOF
+# Generated by agent-init v${VERSION} on $(date +%Y-%m-%d). Do not hand-edit.
+# Edit .agents/specialists/*.yaml then run \`agent-init sync\`.
+
+model = "$CODEX_REVIEWER"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "medium"
+
+[features]
+codex_hooks = true
+multi_agent = true
+
+[sandbox_workspace_write]
+network_access = false
+
+[agents]
+max_threads = 4
+max_depth = 1
+
+[agents.planner]
+description = "Decomposes complex tasks into ordered, verifiable steps before any code is written."
+config_file = ".codex/agents/planner.toml"
+
+[agents.code-reviewer]
+description = "Reviews diffs for correctness, security, and missing tests."
+config_file = ".codex/agents/code-reviewer.toml"
+
+[agents.test-runner]
+description = "Runs and triages test failures in the current workspace."
+config_file = ".codex/agents/test-runner.toml"
+
+[agents.debugger]
+description = "Reproduces and root-causes bugs from a failing test or error message."
+config_file = ".codex/agents/debugger.toml"
+EOF
+
+  # MCP servers — render from .agents/mcp.yaml if present
+  if [[ -f "$SOT_DIR/mcp.yaml" ]]; then
+    echo ""
+    echo "# MCP servers (rendered from $SOT_DIR/mcp.yaml — uncomment to enable)"
+    render_codex_mcp_blocks
+  fi
+}
+
+render_codex_hooks_json() {
+  cat <<'JSON'
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "^Bash$",
+      "hooks": [{
+        "type": "command",
+        "command": ".agents/hooks/danger-guard.sh",
+        "timeout": 30,
+        "statusMessage": "Checking command for destructive patterns"
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "apply_patch|Bash",
+      "hooks": [{
+        "type": "command",
+        "command": ".agents/hooks/format.sh",
+        "timeout": 60
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": ".agents/hooks/test-on-stop.sh",
+        "timeout": 600
+      }]
+    }]
+  }
+}
+JSON
+}
+
+# Render Codex MCP server TOML blocks from .agents/mcp.yaml.
+# Simple YAML parser — assumes our exact format.
+render_codex_mcp_blocks() {
+  awk '
+    BEGIN { in_server=0 }
+    /^[[:space:]]*-[[:space:]]+name:/ {
+      if (in_server) print ""
+      gsub(/^[[:space:]]*-[[:space:]]+name:[[:space:]]*/, "")
+      gsub(/[[:space:]]+$/, "")
+      name=$0
+      in_server=1
+      transport=""; cmd=""; args_line=""; url=""; auth_env=""; desc=""
+      next
+    }
+    in_server && /^[[:space:]]+description:/ { sub(/^[[:space:]]+description:[[:space:]]*/, ""); desc=$0; next }
+    in_server && /^[[:space:]]+transport:/   { sub(/^[[:space:]]+transport:[[:space:]]*/,   ""); transport=$0; next }
+    in_server && /^[[:space:]]+command:/     { sub(/^[[:space:]]+command:[[:space:]]*/,     ""); cmd=$0; next }
+    in_server && /^[[:space:]]+args:/        { sub(/^[[:space:]]+args:[[:space:]]*/,        ""); args_line=$0; next }
+    in_server && /^[[:space:]]+url:/         { sub(/^[[:space:]]+url:[[:space:]]*/,         ""); url=$0; next }
+    in_server && /^[[:space:]]+auth_env:/    { sub(/^[[:space:]]+auth_env:[[:space:]]*/,    ""); auth_env=$0; next }
+    in_server && /^[a-zA-Z]/ {
+      flush_server()
+      in_server=0
+    }
+    END { if (in_server) flush_server() }
+
+    function flush_server() {
+      if (name == "") return
+      printf "\n# %s\n", desc
+      printf "# [mcp_servers.%s]\n", name
+      if (transport == "http") {
+        printf "# url = \"%s\"\n", url
+        if (auth_env != "") printf "# bearer_token_env_var = \"%s\"\n", auth_env
+      } else {
+        if (cmd != "") printf "# command = \"%s\"\n", cmd
+        if (args_line != "") {
+          # args_line is like: [-y, "@upstash/context7-mcp"]
+          gsub(/^\[/, "", args_line); gsub(/\][[:space:]]*$/, "", args_line)
+          printf "# args = [%s]\n", args_line
+        }
+      }
+    }
+  ' "$SOT_DIR/mcp.yaml"
+}
+
+# Render Claude MCP_SETUP.md (concise install commands + reference to .agents/mcp.yaml).
+render_claude_mcp_setup() {
+  cat <<'EOF'
+# MCP Setup — Claude Code
+
+Servers are defined in `.agents/mcp.yaml` (logical, tool-agnostic). This doc
+shows the equivalent `claude mcp add` commands.
+
+## Quick installs
+
+```bash
+# GitHub (official, hosted, OAuth)
+claude mcp add --transport http --scope user github https://api.githubcopilot.com/mcp/ \
+  --header "Authorization: Bearer $GITHUB_PAT"
+
+# Context7 (live library docs)
+claude mcp add --scope user context7 "npx -y @upstash/context7-mcp"
+
+# Postgres / Redshift
+claude mcp add --scope project postgres "npx -y @modelcontextprotocol/server-postgres" \
+  --env "POSTGRES_CONNECTION_STRING=postgres://USER:PASS@HOST:5432/DB"
+
+# Playwright (browser automation)
+claude mcp add --scope project playwright "npx -y @playwright/mcp@latest"
+
+# Sentry (OAuth)
+claude mcp add --transport http --scope user sentry https://mcp.sentry.dev/mcp
+```
+
+## Discipline
+
+- Cap at 5–7 servers per project — even with Tool Search, more = slower selection.
+- Vendor-maintained > community. Audit credentials quarterly.
+- Pin versions in `.mcp.json` once a server works.
+- Project-scope for shared dev tools; user-scope for personal credentials.
+
+See `.agents/mcp.yaml` for the canonical list; edit it and run `agent-init sync`.
+
+For comprehensive references including 60+ servers, see the original repo docs.
+EOF
+}
+
+# Render Codex MCP_SETUP.md.
+render_codex_mcp_setup() {
+  cat <<'EOF'
+# MCP Setup — Codex CLI
+
+Servers are defined in `.agents/mcp.yaml` (logical, tool-agnostic). This doc
+shows the equivalent Codex CLI commands and TOML blocks.
+
+## Quick installs
+
+```bash
+# GitHub (HTTP, bearer token)
+codex mcp add --url https://api.githubcopilot.com/mcp/ github \
+  --header "Authorization: Bearer $GITHUB_PAT"
+
+# Context7 (stdio)
+codex mcp add context7 -- npx -y @upstash/context7-mcp
+
+# Playwright
+codex mcp add playwright -- npx @playwright/mcp@latest
+
+# Sentry (OAuth)
+codex mcp add --url https://mcp.sentry.dev/mcp sentry
+codex mcp authenticate sentry
+```
+
+## TOML blocks (for `~/.codex/config.toml` or `.codex/config.toml`)
+
+```toml
+[mcp_servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+bearer_token_env_var = "GITHUB_PAT"
+
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+
+[mcp_servers.postgres]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-postgres"]
+env_vars = ["POSTGRES_CONNECTION_STRING"]
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest"]
+
+[mcp_servers.sentry]
+url = "https://mcp.sentry.dev/mcp"
+```
+
+## Discipline
+
+- Project-scoped MCP servers in `.codex/config.toml` only load for **trusted projects**.
+  Run `codex` once and accept the trust prompt before they'll fire.
+- Use `bearer_token_env_var` (not literal secrets in TOML).
+- Codex doesn't support classic SSE for stdio servers — only stdio and streamable HTTP.
+
+See `.agents/mcp.yaml` for the canonical list; edit it and run `agent-init sync`.
+EOF
+}
+
+# ============================================================================
+# Map Claude model tier ↔ Codex model
+# ============================================================================
+
+# Given a specialist name, return the configured Claude model.
+claude_model_for() {
+  case "$1" in
+    planner)       echo "$CLAUDE_PLANNER" ;;
+    code-reviewer) echo "$CLAUDE_REVIEWER" ;;
+    test-runner)   echo "$CLAUDE_TESTRUNNER" ;;
+    debugger)      echo "$CLAUDE_DEBUGGER" ;;
+    *)             echo "sonnet" ;;
+  esac
+}
+
+# Same for Codex.
+codex_model_for() {
+  case "$1" in
+    planner)       echo "$CODEX_PLANNER" ;;
+    code-reviewer) echo "$CODEX_REVIEWER" ;;
+    test-runner)   echo "$CODEX_TESTRUNNER" ;;
+    debugger)      echo "$CODEX_DEBUGGER" ;;
+    *)             echo "gpt-5.4" ;;
+  esac
+}
+
+codex_effort_for() {
+  case "$1" in
+    planner)       echo "$CODEX_PLANNER_EFFORT" ;;
+    code-reviewer) echo "$CODEX_REVIEWER_EFFORT" ;;
+    test-runner)   echo "$CODEX_TESTRUNNER_EFFORT" ;;
+    debugger)      echo "$CODEX_DEBUGGER_EFFORT" ;;
+    *)             echo "medium" ;;
+  esac
+}
+
+# ============================================================================
+# Source-of-truth materialization
+# ============================================================================
+
+write_source_of_truth() {
+  # AGENTS.md
+  write_text "AGENTS.md" "$(build_agents_md)"
+
+  # Specialists
+  write_text "$SOT_DIR/specialists/planner.yaml"       "$(build_specialist_planner)"
+  write_text "$SOT_DIR/specialists/code-reviewer.yaml" "$(build_specialist_reviewer)"
+  write_text "$SOT_DIR/specialists/test-runner.yaml"   "$(build_specialist_testrunner)"
+  write_text "$SOT_DIR/specialists/debugger.yaml"      "$(build_specialist_debugger)"
+
+  # Skills
+  write_text "$SOT_DIR/skills/plan/SKILL.md"   "$(build_skill_plan)"
+  write_text "$SOT_DIR/skills/review/SKILL.md" "$(build_skill_review)"
+  write_text "$SOT_DIR/skills/ship/SKILL.md"   "$(build_skill_ship)"
+
+  # Hooks
+  write_exec "$SOT_DIR/hooks/format.sh"       "$(build_hook_format)"
+  write_exec "$SOT_DIR/hooks/danger-guard.sh" "$(build_hook_danger)"
+  write_exec "$SOT_DIR/hooks/test-on-stop.sh" "$(build_hook_stop)"
+
+  # MCP
+  write_text "$SOT_DIR/mcp.yaml" "$(build_mcp_yaml)"
+}
+
+render_claude_tree() {
+  needs_claude || return 0
+  if [[ $DRY_RUN -eq 1 ]]; then
+    # In dry-run mode the source of truth wasn't actually written, so the
+    # YAML→Markdown renderer would fail trying to read it. Just announce intent.
+    plan_ "would create CLAUDE.md (bridge)"
+    plan_ "would create .claude/settings.json"
+    plan_ "would create .claude/agents/{planner,code-reviewer,test-runner,debugger}.md"
+    plan_ "would create .claude/commands/{plan,review,ship}.md"
+    plan_ "would create .claude/MCP_SETUP.md"
+    return 0
+  fi
+
+  # Bridge file
+  write_text "CLAUDE.md" "$(build_claude_md_bridge)"
+
+  # Hooks config
+  write_text ".claude/settings.json" "$(render_claude_settings)"
+
+  # Specialists
+  for s in planner code-reviewer test-runner debugger; do
+    local model
+    model="$(claude_model_for "$s")"
+    write_text ".claude/agents/$s.md" "$(render_claude_specialist "$SOT_DIR/specialists/$s.yaml" "$model")"
+  done
+
+  # Slash commands (point at the shared skills)
+  write_text ".claude/commands/plan.md"   "$(printf -- '---\ndescription: Decompose a feature request via the plan skill.\n---\n\nUse the `plan` skill from `.agents/skills/plan/SKILL.md`. Pass: $ARGUMENTS\n')"
+  write_text ".claude/commands/review.md" "$(printf -- '---\ndescription: Review uncommitted changes via the review skill.\n---\n\nUse the `review` skill from `.agents/skills/review/SKILL.md`. Pass: $ARGUMENTS\n')"
+  write_text ".claude/commands/ship.md"   "$(printf -- '---\ndescription: Run tests and commit via the ship skill.\n---\n\nUse the `ship` skill from `.agents/skills/ship/SKILL.md`. Pass: $ARGUMENTS\n')"
+
+  # MCP reference
+  write_text ".claude/MCP_SETUP.md" "$(render_claude_mcp_setup)"
+}
+
+render_codex_tree() {
+  needs_codex || return 0
+  if [[ $DRY_RUN -eq 1 ]]; then
+    plan_ "would create .codex/config.toml"
+    plan_ "would create .codex/hooks.json"
+    plan_ "would create .codex/agents/{planner,code-reviewer,test-runner,debugger}.toml"
+    plan_ "would create .codex/skills/{plan,review,ship} as symlinks to .agents/skills/"
+    plan_ "would create .codex/MCP_SETUP.md"
+    return 0
+  fi
+
+  # Config
+  write_text ".codex/config.toml" "$(render_codex_config)"
+  write_text ".codex/hooks.json"  "$(render_codex_hooks_json)"
+
+  # Specialists
+  for s in planner code-reviewer test-runner debugger; do
+    local model effort
+    model="$(codex_model_for "$s")"
+    effort="$(codex_effort_for "$s")"
+    write_text ".codex/agents/$s.toml" "$(render_codex_specialist "$SOT_DIR/specialists/$s.yaml" "$model" "$effort")"
+  done
+
+  # Skills — symlink the directories so edits to .agents/skills/ propagate.
+  for skill in plan review ship; do
+    ensure_symlink ".codex/skills/$skill" "../../.agents/skills/$skill"
+  done
+
+  # MCP reference
+  write_text ".codex/MCP_SETUP.md" "$(render_codex_mcp_setup)"
+}
+
+# ============================================================================
+# Subcommand: init
+# ============================================================================
+
+run_init() {
+  log ""
+  log "${B}agent-init v${VERSION}${R}  (subcommand: init)"
+  log "${D}project:${R} ${PROJECT_NAME}"
+  log "${D}agent:${R}   $AGENT_MODE"
+  log "${D}stack:${R}   $(IFS=, ; echo "${STACKS[*]}")"
+  [[ $DRY_RUN -eq 1 ]] && warn "DRY RUN — no files will be written"
+  log ""
+
+  write_source_of_truth
+  render_claude_tree
+  render_codex_tree
+  add_gitignore
+
+  log ""
+  log "${GR}${B}Done.${R}"
+  log ""
+  log "Specialist models applied:"
+  if needs_claude; then
+    log "  ${D}Claude:${R} planner=$(cap_claude "$CLAUDE_PLANNER") · reviewer=$(cap_claude "$CLAUDE_REVIEWER") · test-runner=$(cap_claude "$CLAUDE_TESTRUNNER") · debugger=$(cap_claude "$CLAUDE_DEBUGGER")"
+  fi
+  if needs_codex; then
+    log "  ${D}Codex:${R}  planner=$CODEX_PLANNER · reviewer=$CODEX_REVIEWER · test-runner=$CODEX_TESTRUNNER · debugger=$CODEX_DEBUGGER"
+  fi
+  log ""
+  log "Next steps:"
+  log "  ${D}1.${R}  Open ${B}AGENTS.md${R} and fill in the TODO sections."
+  log "  ${D}2.${R}  Edit ${B}.agents/${R} files — they're the source of truth."
+  log "  ${D}3.${R}  Run ${B}agent-init sync${R} after editing .agents/ to refresh .claude/ and .codex/."
+  if needs_codex; then
+    log ""
+    log "${YL}Codex trust gate:${R} project-scoped .codex/ config (hooks, MCP) only loads"
+    log "for trusted projects. Run ${B}codex${R} once in this dir and accept the trust prompt."
+  fi
+  log ""
+  log "Maintenance:"
+  log "  ${B}agent-init doctor${R}   detect drift / broken links / missing trust"
+  log "  ${B}agent-init sync${R}     re-render .claude/ and .codex/ from .agents/"
+  log "  ${B}agent-init migrate${R}  upgrade a legacy claude-init project to v2 layout"
+  log ""
+}
+
+# ============================================================================
+# Subcommand: sync
+# ============================================================================
+
+run_sync() {
+  log ""
+  log "${B}agent-init sync${R}  (re-render generated artifacts from .agents/)"
+  log "${D}agent:${R} $AGENT_MODE"
+  log ""
+
+  if [[ ! -d "$SOT_DIR" ]]; then
+    err "No $SOT_DIR/ directory found. Run \`agent-init init\` first."
+    exit 1
+  fi
+
+  # sync = "make generated artifacts match source of truth"; always overwrite.
+  FORCE=1
+
+  # Re-render only — don't touch AGENTS.md or hooks (they live in .agents/)
+  render_claude_tree
+  render_codex_tree
+
+  log ""
+  log "${GR}${B}Synced.${R}"
+}
+
+# ============================================================================
+# Subcommand: doctor
+# ============================================================================
+
+run_doctor() {
+  log ""
+  log "${B}agent-init doctor${R}  (drift, broken links, trust gate)"
+  log ""
+
+  local issues=0
+
+  # 1. Source of truth exists
+  if [[ ! -d "$SOT_DIR" ]]; then
+    err "Missing $SOT_DIR/ — run \`agent-init init\` first."
+    return 1
+  fi
+  ok "$SOT_DIR/ exists"
+
+  # 2. AGENTS.md exists
+  if [[ -f AGENTS.md ]]; then
+    ok "AGENTS.md exists ($(wc -l < AGENTS.md) lines)"
+    local lines
+    lines=$(wc -l < AGENTS.md)
+    if [[ $lines -gt 250 ]]; then
+      warn "AGENTS.md is $lines lines — consider trimming. Agents follow ~150–200 lines reliably."
+      issues=$((issues + 1))
+    fi
+  else
+    err "AGENTS.md missing"
+    issues=$((issues + 1))
+  fi
+
+  # 3. CLAUDE.md is a bridge (only if Claude is in play)
+  if needs_claude; then
+    if [[ -f CLAUDE.md ]]; then
+      if grep -q "^@AGENTS.md" CLAUDE.md 2>/dev/null; then
+        ok "CLAUDE.md is a valid @AGENTS.md bridge"
+      else
+        warn "CLAUDE.md exists but doesn't @-import AGENTS.md — risk of drift between project memories."
+        issues=$((issues + 1))
+      fi
+    else
+      err "CLAUDE.md missing (required when --agent includes claude)"
+      issues=$((issues + 1))
+    fi
+  fi
+
+  # 4. Hook scripts exist and are executable
+  for h in format.sh danger-guard.sh test-on-stop.sh; do
+    if [[ ! -f "$SOT_DIR/hooks/$h" ]]; then
+      err "Missing $SOT_DIR/hooks/$h"
+      issues=$((issues + 1))
+    elif [[ ! -x "$SOT_DIR/hooks/$h" ]]; then
+      err "$SOT_DIR/hooks/$h is not executable (chmod +x to fix)"
+      issues=$((issues + 1))
+    else
+      ok "$SOT_DIR/hooks/$h exists and is executable"
+    fi
+  done
+
+  # 5. Claude tree drift detection (compare rendered output to actual files)
+  if needs_claude; then
+    if [[ ! -d .claude ]]; then
+      err ".claude/ missing — run \`agent-init sync\`"
+      issues=$((issues + 1))
+    else
+      local drift=0
+      for s in planner code-reviewer test-runner debugger; do
+        local model expected actual
+        model="$(claude_model_for "$s")"
+        expected="$(render_claude_specialist "$SOT_DIR/specialists/$s.yaml" "$model")"
+        while [[ "$expected" == *$'\n' ]]; do expected="${expected%$'\n'}"; done
+        if [[ -f ".claude/agents/$s.md" ]]; then
+          actual="$(cat ".claude/agents/$s.md")"
+          while [[ "$actual" == *$'\n' ]]; do actual="${actual%$'\n'}"; done
+          if [[ "$expected" != "$actual" ]]; then
+            warn ".claude/agents/$s.md is out of sync with .agents/specialists/$s.yaml"
+            drift=$((drift + 1))
+            issues=$((issues + 1))
+          fi
+        else
+          err ".claude/agents/$s.md missing"
+          issues=$((issues + 1))
+        fi
+      done
+      [[ $drift -eq 0 ]] && ok "Claude specialists in sync with $SOT_DIR/specialists/"
+    fi
+  fi
+
+  # 6. Codex tree drift + symlinks
+  if needs_codex; then
+    if [[ ! -d .codex ]]; then
+      err ".codex/ missing — run \`agent-init sync\`"
+      issues=$((issues + 1))
+    else
+      local drift=0
+      for s in planner code-reviewer test-runner debugger; do
+        local model effort expected actual
+        model="$(codex_model_for "$s")"
+        effort="$(codex_effort_for "$s")"
+        expected="$(render_codex_specialist "$SOT_DIR/specialists/$s.yaml" "$model" "$effort")"
+        while [[ "$expected" == *$'\n' ]]; do expected="${expected%$'\n'}"; done
+        if [[ -f ".codex/agents/$s.toml" ]]; then
+          actual="$(cat ".codex/agents/$s.toml")"
+          while [[ "$actual" == *$'\n' ]]; do actual="${actual%$'\n'}"; done
+          if [[ "$expected" != "$actual" ]]; then
+            warn ".codex/agents/$s.toml is out of sync with .agents/specialists/$s.yaml"
+            drift=$((drift + 1))
+            issues=$((issues + 1))
+          fi
+        else
+          err ".codex/agents/$s.toml missing"
+          issues=$((issues + 1))
+        fi
+      done
+      [[ $drift -eq 0 ]] && ok "Codex specialists in sync with $SOT_DIR/specialists/"
+
+      # Skill symlinks
+      for skill in plan review ship; do
+        local link=".codex/skills/$skill" target="../../.agents/skills/$skill"
+        if [[ -L "$link" ]]; then
+          local current
+          current="$(readlink "$link")"
+          if [[ "$current" == "$target" ]]; then
+            ok ".codex/skills/$skill → $target"
+          else
+            warn ".codex/skills/$skill points to '$current' (expected '$target')"
+            issues=$((issues + 1))
+          fi
+        else
+          warn ".codex/skills/$skill is not a symlink (run \`agent-init sync\` to fix)"
+          issues=$((issues + 1))
+        fi
+      done
+
+      # Codex trust-gate reminder (we can't check programmatically without invoking codex)
+      note "Codex trust: project .codex/ (hooks, MCP) only loads after \`codex\` is run here and you accept the trust prompt."
+    fi
+  fi
+
+  # 7. .gitignore sanity
+  if [[ -f .gitignore ]]; then
+    for must_ignore in ".codex/auth.json" ".claude/settings.local.json"; do
+      if ! grep -qxF "$must_ignore" .gitignore 2>/dev/null; then
+        warn ".gitignore does not list \`$must_ignore\` — credentials risk"
+        issues=$((issues + 1))
+      fi
+    done
+  else
+    warn "No .gitignore — run \`agent-init init\` to create one"
+    issues=$((issues + 1))
+  fi
+
+  log ""
+  if [[ $issues -eq 0 ]]; then
+    log "${GR}${B}✓ All checks passed.${R}"
+  else
+    log "${YL}${B}$issues issue(s) found.${R} Run \`agent-init sync${R} or ${B}--force\` to repair generated artifacts."
+    exit 1
+  fi
+}
+
+# ============================================================================
+# Subcommand: migrate (upgrade legacy claude-init v1.x projects)
+# ============================================================================
+
+run_migrate() {
+  log ""
+  log "${B}agent-init migrate${R}  (upgrade legacy claude-init layout → agent-init v2)"
+  log ""
+
+  local legacy_signals=0
+  [[ -d .claude && ! -d .agents ]] && legacy_signals=$((legacy_signals + 1))
+  [[ -f CLAUDE.md ]] && ! grep -q "^@AGENTS.md" CLAUDE.md 2>/dev/null && legacy_signals=$((legacy_signals + 1))
+
+  if [[ $legacy_signals -eq 0 ]]; then
+    note "No legacy layout detected. Project may already be migrated, or it's a fresh init target."
+    note "Run \`agent-init init\` to scaffold from scratch."
+    exit 0
+  fi
+
+  log "Detected legacy claude-init layout. Migration plan:"
+  log "  1. Move CLAUDE.md content → AGENTS.md (back up CLAUDE.md to *.bak.${TIMESTAMP})"
+  log "  2. Write a new CLAUDE.md as a thin @AGENTS.md bridge"
+  log "  3. Build .agents/ source-of-truth from current .claude/ files"
+  log "  4. Re-render .claude/ from .agents/ (with backups)"
+  log "  5. Optionally render .codex/ if --agent includes codex"
+  log ""
+
+  if [[ $DRY_RUN -eq 0 ]] && [[ -t 0 ]]; then
+    printf "Proceed? [y/N] " >&2
+    read -r ans
+    [[ "$ans" != "y" && "$ans" != "Y" ]] && { warn "Cancelled."; exit 0; }
+  fi
+
+  # Step 1+2: promote CLAUDE.md → AGENTS.md, install bridge
+  local agents_md_was_promoted=0
+  if [[ -f CLAUDE.md ]] && ! grep -q "^@AGENTS.md" CLAUDE.md 2>/dev/null; then
+    if [[ ! -f AGENTS.md ]]; then
+      if [[ $DRY_RUN -eq 0 ]]; then
+        cp CLAUDE.md "CLAUDE.md.bak.${TIMESTAMP}"; back "CLAUDE.md.bak.${TIMESTAMP}"
+        # Strip Claude-specific header comments, write to AGENTS.md
+        sed 's/<!-- Initialized by claude-init/<!-- Migrated by agent-init/' CLAUDE.md > AGENTS.md
+        make_ "AGENTS.md (migrated from CLAUDE.md — your prose preserved)"
+        printf "%s\n" "$(build_claude_md_bridge)" > CLAUDE.md
+        make_ "CLAUDE.md (now a thin @AGENTS.md bridge)"
+        agents_md_was_promoted=1
+      else
+        plan_ "would migrate CLAUDE.md → AGENTS.md and install bridge"
+      fi
+    else
+      warn "AGENTS.md already exists — leaving CLAUDE.md alone. Manually verify alignment."
+    fi
+  fi
+
+  # Step 3: build .agents/ source of truth — specialists, skills, hooks, mcp
+  # NB: AGENTS.md skipped when we just promoted user content to it.
+  warn "Specialist customizations in .claude/agents/*.md will be re-baselined from defaults."
+  warn "Originals get backed up via --force semantics during render."
+  FORCE=1   # force-overwrite the legacy .claude/ files so they get fresh symlinks/configs
+
+  if [[ $agents_md_was_promoted -eq 0 ]]; then
+    # Fresh migration without prior CLAUDE.md content — write default AGENTS.md template
+    write_text "AGENTS.md" "$(build_agents_md)"
+  fi
+
+  # Specialists, skills, hooks, mcp — these are pure agent-init scaffolding
+  write_text "$SOT_DIR/specialists/planner.yaml"       "$(build_specialist_planner)"
+  write_text "$SOT_DIR/specialists/code-reviewer.yaml" "$(build_specialist_reviewer)"
+  write_text "$SOT_DIR/specialists/test-runner.yaml"   "$(build_specialist_testrunner)"
+  write_text "$SOT_DIR/specialists/debugger.yaml"      "$(build_specialist_debugger)"
+  write_text "$SOT_DIR/skills/plan/SKILL.md"           "$(build_skill_plan)"
+  write_text "$SOT_DIR/skills/review/SKILL.md"         "$(build_skill_review)"
+  write_text "$SOT_DIR/skills/ship/SKILL.md"           "$(build_skill_ship)"
+  write_exec "$SOT_DIR/hooks/format.sh"                "$(build_hook_format)"
+  write_exec "$SOT_DIR/hooks/danger-guard.sh"          "$(build_hook_danger)"
+  write_exec "$SOT_DIR/hooks/test-on-stop.sh"          "$(build_hook_stop)"
+  write_text "$SOT_DIR/mcp.yaml"                       "$(build_mcp_yaml)"
+
+  # Step 4: re-render .claude/
+  render_claude_tree
+
+  # Step 5: optionally render .codex/
+  if needs_codex; then
+    render_codex_tree
+  fi
+
+  add_gitignore
+
+  log ""
+  log "${GR}${B}Migration complete.${R}"
+  log ""
+  log "Originals backed up to *.bak.${TIMESTAMP}. Verify, then commit."
+}
+
+# ============================================================================
+# Dispatch
+# ============================================================================
+
+case "$SUBCOMMAND" in
+  init)    run_init ;;
+  sync)    run_sync ;;
+  doctor)  run_doctor ;;
+  migrate) run_migrate ;;
+esac

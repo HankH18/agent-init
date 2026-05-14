@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backup files agent-init produces during --force or migrate
+*.bak.[0-9]*
+
+# Test scratch dirs (if you run the test suite locally)
+/tmp/proj-*/
+/tmp/agent-init-work/
+.claude/SKIP_TESTS
+.claude/local/
+.claude/settings.local.json
