@@ -146,8 +146,8 @@ agent-init --codex-planner=gpt-5-pro --codex-test-runner=gpt-5.4-mini
 |-----------------------|--------------|
 | `agent-init`          | Initialize a fresh project (creates `.agents/`, renders `.claude/` and/or `.codex/`) |
 | `agent-init sync`     | Re-render `.claude/` and `.codex/` from `.agents/` — always force-overwrites |
-| `agent-init doctor`   | Drift detection (rendered files vs source of truth), broken symlinks, gitignore sanity, Codex trust gate reminder |
-| `agent-init migrate`  | Upgrade a legacy `claude-init` project: promote `CLAUDE.md` to `AGENTS.md`, install bridge, build `.agents/`, re-render |
+| `agent-init doctor`   | Drift detection for specialist files (.claude/agents, .codex/agents) against .agents/specialists; broken symlinks; gitignore sanity; Codex trust gate reminder |
+| `agent-init migrate`  | Upgrade a legacy `claude-init` project: promote `CLAUDE.md` to `AGENTS.md`, install bridge, build `.agents/`, re-render Customized `.claude/agents/*.md` are backed up and re-baselined from defaults, not imported. |
 
 Common flags work across all subcommands: `--agent=`, `--force`, `--dry-run`, `--quiet`.
 
@@ -173,7 +173,7 @@ Common flags work across all subcommands: `--agent=`, `--force`, `--dry-run`, `-
 
 **Stack detection** auto-detects Node/TypeScript, Python, Rust, Go, Ruby, PHP, JVM, Terraform, Serverless, Docker — and writes appropriate test/build/lint commands into `AGENTS.md`.
 
-**MCP reference** — `.agents/mcp.yaml` lists 5 starter servers (GitHub, Context7, Postgres, Playwright, Sentry); the renderers produce copy-paste install commands in both `.claude/MCP_SETUP.md` (JSON / `claude mcp add`) and `.codex/MCP_SETUP.md` (TOML / `codex mcp add`).
+**MCP reference** — `.agents/mcp.yaml` lists 5 starter servers (GitHub, Context7, Postgres, Playwright, Sentry); the renderers produce copy-paste install commands in both `.claude/MCP_SETUP.md` (JSON / `claude mcp add`) and `.codex/MCP_SETUP.md` (TOML / `codex mcp add`). A longer server reference is in [docs/MCP_REFERENCE.md](docs/MCP_REFERENCE.md).
 
 ---
 
@@ -284,7 +284,7 @@ gh repo create agent-init --public --source=. --push
 | Drift detection | — | `agent-init doctor` |
 | Migration | — | `agent-init migrate` |
 
-If you only use Claude Code, `claude-init` is simpler. If you use both — or want the option — use `agent-init`.
+`claude-init` (Claude-only, v1.3.0) is superseded; `agent-init --agent=claude` produces the Claude-only setup and `agent-init migrate` upgrades old projects. If you use both — or want the option — use `agent-init`.
 
 ---
 

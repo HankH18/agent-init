@@ -1,4 +1,4 @@
-# MCP Setup — Comprehensive Reference
+# MCP Server Reference (Claude Code)
 
 Curated MCP servers for Claude Code, organized by purpose. Every entry includes
 install command, when to reach for it, and gotchas. Pick what serves your

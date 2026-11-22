@@ -49,7 +49,7 @@ Initial public release of `agent-init` as a separate project from `claude-init`.
 - The danger-guard hook is defense-in-depth, not a hard boundary, on the Codex side — `PreToolUse` does not yet reliably fire for `apply_patch` and MCP tool calls (see [openai/codex#16732](https://github.com/openai/codex/issues/16732)).
 - Subagent project-config has an open regression: [openai/codex#14579](https://github.com/openai/codex/issues/14579). The renderer pins specialist names in `[agents.<name>]` blocks in `.codex/config.toml` with explicit `config_file` paths, which is the documented workaround.
 
-### Diff from `claude-init` v1.3.1
+### Diff from `claude-init` v1.3.0
 
 - Binary renamed: `claude-init` → `agent-init`. Run `agent-init migrate` inside a `claude-init`-scaffolded project to upgrade.
 - `.claude/` is no longer hand-edited; edit `.agents/specialists/*.yaml` and run `agent-init sync`.
