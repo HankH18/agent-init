@@ -147,7 +147,7 @@ agent-init --codex-planner=gpt-5-pro --codex-test-runner=gpt-5.4-mini
 | `agent-init`          | Initialize a fresh project (creates `.agents/`, renders `.claude/` and/or `.codex/`) |
 | `agent-init sync`     | Re-render `.claude/` and `.codex/` from `.agents/` — always force-overwrites |
 | `agent-init doctor`   | Drift detection for specialist files (.claude/agents, .codex/agents) against .agents/specialists; broken symlinks; gitignore sanity; Codex trust gate reminder |
-| `agent-init migrate`  | Upgrade a legacy `claude-init` project: promote `CLAUDE.md` to `AGENTS.md`, install bridge, build `.agents/`, re-render Customized `.claude/agents/*.md` are backed up and re-baselined from defaults, not imported. |
+| `agent-init migrate`  | Upgrade a legacy `claude-init` project: promote `CLAUDE.md` to `AGENTS.md`, install bridge, build `.agents/`, re-render. Customized `.claude/agents/*.md` are backed up and re-baselined from defaults, not imported. |
 
 Common flags work across all subcommands: `--agent=`, `--force`, `--dry-run`, `--quiet`.
 
